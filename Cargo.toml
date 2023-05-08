@@ -1,0 +1,15 @@
+[package]
+name = "ctydat"
+version = "0.1.0"
+authors = [ "Ossi Herrala OH8HUB <oherrala@iki.fi>" ]
+description = "A parser for CTY.DAT file format"
+license = "MIT"
+edition = "2021"
+
+readme = "README.md"
+repository = "https://github.com/oherrala/ctydat"
+keywords = [ "parser" ]
+categories = [ "encoding" ]
+
+[dependencies]
+chumsky = "0.9"
