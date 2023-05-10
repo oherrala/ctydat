@@ -17,7 +17,7 @@ impl Ctydat {
     pub fn from_str(s: &str) -> io::Result<Ctydat> {
         let values = parser()
             .parse(s)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, "parse error"))?;
+            .map_err(|_err| io::Error::new(io::ErrorKind::InvalidInput, "parse error"))?;
         Ok(Ctydat { values })
     }
 }
@@ -54,13 +54,22 @@ pub struct Country {
 #[derive(Debug, Clone)]
 pub enum Prefix {
     /// A single prefix
-    Callsign(String),
+    Callsign(String, Option<Vec<Override>>),
     /// A full callsign
-    Prefix(String),
+    Prefix(String, Option<Vec<Override>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Override {
+    CqZone(u8),
+    ItuZone(u8),
+    Coordinates((f32, f32)),
+    Continent(String),
+    TimeOffset(f32),
 }
 
 fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
-    let ascii_not_comma = |c: &char| c.is_ascii() && *c != ':';
+    let ascii_not_comma = |c: &char| c.is_ascii() && !c.is_control() && *c != ':';
     let ascii_float = |c: &char| c.is_ascii_digit() || *c == '-' || *c == '.';
 
     let country_name = filter(ascii_not_comma)
@@ -108,15 +117,38 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
         .collect();
 
     let prefix_list = {
-        let prefix = filter(|c: &char| c.is_ascii() && *c != ',' && *c != ';')
+        let prefix = filter(|c: &char| c.is_ascii_alphanumeric() || *c == '/')
             .repeated()
             .labelled("DXCC Prefix")
             .collect();
         let callsign = just("=").ignore_then(prefix).labelled("Exact callsign");
 
+        // The following special characters can be applied after an alias prefix:
+        // (#)      Override CQ Zone
+        // [#]      Override ITU Zone
+        // <#/#>    Override latitude/longitude
+        // {aa}     Override Continent
+        // ~#~      Override local time offset from GMT
+        let over_ride = cq_zone
+            .delimited_by(just('['), just(']'))
+            .map(Override::CqZone)
+            .or(itu_zone
+                .delimited_by(just('('), just(')'))
+                .map(Override::ItuZone))
+            .or(continent
+                .delimited_by(just('{'), just('}'))
+                .map(Override::Continent))
+            .or(time_offset
+                .delimited_by(just('~'), just('~'))
+                .map(Override::TimeOffset))
+            .or(latitude.then_ignore(just('/')).then(longitude).delimited_by(just('<'), just('>')).map(Override::Coordinates));
+
         let one_dxcc = callsign
-            .map(|c| Prefix::Callsign(c))
-            .or(prefix.map(|p| Prefix::Prefix(p)));
+            .then(over_ride.repeated())
+            .map(|(c, o)| Prefix::Callsign(c, empty_is_none(o)))
+            .or(prefix
+                .then(over_ride.repeated())
+                .map(|(p, o)| Prefix::Prefix(p, empty_is_none(o))));
 
         one_dxcc
             .padded()
@@ -166,6 +198,14 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
         });
 
     one_country.repeated()
+}
+
+fn empty_is_none<V>(i: Vec<V>) -> Option<Vec<V>> {
+    if i.is_empty() {
+        None
+    } else {
+        Some(i)
+    }
 }
 
 #[cfg(test)]
