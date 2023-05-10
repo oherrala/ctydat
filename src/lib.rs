@@ -4,9 +4,11 @@
 
 use std::char;
 use std::io;
+use std::path::Path;
 
 use chumsky::prelude::*;
 use chumsky::text::newline;
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct Ctydat {
@@ -14,11 +16,24 @@ pub struct Ctydat {
 }
 
 impl Ctydat {
+    #[instrument(skip(s))]
     pub fn from_str(s: &str) -> io::Result<Ctydat> {
+        let ts = std::time::Instant::now();
         let values = parser()
             .parse(s)
-            .map_err(|_err| io::Error::new(io::ErrorKind::InvalidInput, "parse error"))?;
+            .map_err(|err| {
+                tracing::error!("Parse errors found: {:?}", err);
+                io::Error::new(io::ErrorKind::InvalidInput, "parse error")
+            })?;
+        tracing::debug!("Parsed {} records in {} ms.", values.len(), ts.elapsed().as_millis());
         Ok(Ctydat { values })
+    }
+
+    #[instrument(fields(path = path.as_ref().display().to_string()))]
+    pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
+        let s = std::fs::read(path)?;
+        let s = std::str::from_utf8(&s).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        Self::from_str(s)
     }
 }
 
