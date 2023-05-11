@@ -13,3 +13,8 @@ categories = [ "encoding" ]
 
 [dependencies]
 chumsky = "0.9"
+patricia_tree = "0.5"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = [ "fmt" ] }

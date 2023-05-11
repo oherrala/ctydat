@@ -5,42 +5,79 @@
 use std::char;
 use std::io;
 use std::path::Path;
+use std::rc::Rc;
+use std::time::Instant;
 
 use chumsky::prelude::*;
 use chumsky::text::newline;
+use patricia_tree::PatriciaMap;
 use tracing::instrument;
 
 #[derive(Debug)]
 pub struct Ctydat {
-    pub values: Vec<Country>,
+    prefix_trie: PatriciaMap<(Rc<Country>, Vec<Override>)>,
 }
 
 impl Ctydat {
     #[instrument(skip(s))]
     pub fn from_str(s: &str) -> io::Result<Ctydat> {
-        let ts = std::time::Instant::now();
-        let values = parser()
+        let ts = Instant::now();
+        let countries = parser()
             .parse(s)
             .map_err(|err| {
                 tracing::error!("Parse errors found: {:?}", err);
                 io::Error::new(io::ErrorKind::InvalidInput, "parse error")
             })?;
-        tracing::debug!("Parsed {} records in {} ms.", values.len(), ts.elapsed().as_millis());
-        Ok(Ctydat { values })
+
+        let countries_len = countries.len();
+        let mut prefix_trie = PatriciaMap::new();
+
+        for mut country in countries.into_iter() {
+            let prefix_list = country.prefix_list.clone();
+            country.prefix_list = Vec::new();
+            let country = Rc::new(country);
+            for prefix_alias in prefix_list {
+                match prefix_alias {
+                    Prefix::Prefix(mut prefix, overrides) => {
+                        prefix.make_ascii_lowercase();
+                        prefix_trie.insert_str(&prefix, (country.clone(), overrides.unwrap_or_default()));
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        tracing::debug!(elapsed_ms = ts.elapsed().as_millis(), "Parsed {} records.", countries_len);
+
+        Ok(Ctydat { prefix_trie })
     }
 
-    #[instrument(fields(path = path.as_ref().display().to_string()))]
+    #[instrument(fields(path = %path.as_ref().to_string_lossy()))]
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
         let s = std::fs::read(path)?;
         let s = std::str::from_utf8(&s).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         Self::from_str(s)
+    }
+
+    #[instrument(skip(self))]
+    pub fn find_country_for_callsign(&self, callsign: &str) -> Option<Country> {
+        let ts = Instant::now();
+        let callsign = callsign.to_lowercase();
+        if let Some((_, (country, overrides))) = self.prefix_trie.get_longest_common_prefix(&callsign) {
+            let country = country.implement_overrides(overrides);
+            tracing::debug!(elapsed_μs = ts.elapsed().as_micros(), "Found match for callsign {callsign}: {country:?}.");
+            return Some(country);
+        }
+
+        tracing::debug!(elapsed_μs = ts.elapsed().as_micros(), "Match not found for callsign {callsign}.");
+        None
     }
 }
 
 /// Single country from CTY.DAT file
 ///
 /// <https://www.country-files.com/cty-dat-format/>
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Country {
     /// Country Name
     pub country_name: String,
@@ -65,6 +102,27 @@ pub struct Country {
     pub prefix_list: Vec<Prefix>,
 }
 
+impl Country {
+    /// Return new copy of [Country] after implementing the provided list of [Override]s.
+    fn implement_overrides(&self, overrides: &[Override]) -> Country {
+        let mut country: Country = self.clone();
+        country.prefix_list = Vec::new();
+        for or in overrides {
+            match or {
+                Override::Continent(continent) => country.continent = continent.clone(),
+                Override::Coordinates(lat, lon) => {
+                    country.latitude = *lat;
+                    country.longitude = *lon;
+                }
+                Override::CqZone(cq_zone) => country.cq_zone = *cq_zone,
+                Override::ItuZone(itu_zone) => country.itu_zone = *itu_zone,
+                Override::TimeOffset(offset) => country.time_offset = *offset,
+            }
+        }
+        country
+    }
+}
+
 /// A single prefix or exact callsign
 #[derive(Debug, Clone)]
 pub enum Prefix {
@@ -74,11 +132,15 @@ pub enum Prefix {
     Prefix(String, Option<Vec<Override>>),
 }
 
+/// A [Country] prefix alias list (see [Country::prefix_list]) can include
+/// overrides to some data in [Country]. These are the supported overrides that
+/// can be implemented into [Country] with calling
+/// [Country::implement_overrides] method.
 #[derive(Debug, Clone)]
 pub enum Override {
     CqZone(u8),
     ItuZone(u8),
-    Coordinates((f32, f32)),
+    Coordinates(f32, f32),
     Continent(String),
     TimeOffset(f32),
 }
@@ -156,7 +218,7 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
             .or(time_offset
                 .delimited_by(just('~'), just('~'))
                 .map(Override::TimeOffset))
-            .or(latitude.then_ignore(just('/')).then(longitude).delimited_by(just('<'), just('>')).map(Override::Coordinates));
+            .or(latitude.then_ignore(just('/')).then(longitude).delimited_by(just('<'), just('>')).map(|(lat, lon)| Override::Coordinates(lat, lon)));
 
         let one_dxcc = callsign
             .then(over_ride.repeated())
@@ -225,7 +287,8 @@ fn empty_is_none<V>(i: Vec<V>) -> Option<Vec<V>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Ctydat;
+    use chumsky::Parser;
+    use crate::parser;
 
     const FINLAND: &str = r##"Finland:                  15:  18:  EU:   61.38:   -24.82:    -2.0:  OH:
         OF,OG,OH,OI,OJ,=OH/RX3AMI/LH,
@@ -261,9 +324,8 @@ mod tests {
 
     #[test]
     fn test_parser() {
-        let ctydat = Ctydat::from_str(FINLAND).unwrap();
-        let cty = ctydat.values.first().unwrap();
-        dbg!(&cty);
+        let ctydat = parser().parse(FINLAND).unwrap();
+        let cty = ctydat.first().unwrap();
         assert_eq!(cty.country_name, "Finland");
         assert_eq!(cty.cq_zone, 15);
         assert_eq!(cty.itu_zone, 18);
