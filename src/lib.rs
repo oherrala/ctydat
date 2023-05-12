@@ -11,10 +11,14 @@ use std::time::Instant;
 use chumsky::prelude::*;
 use chumsky::text::newline;
 use patricia_tree::PatriciaMap;
+use tinystr::TinyAsciiStr;
 use tracing::instrument;
 
 #[derive(Debug)]
 pub struct Ctydat {
+    /// A trie holding all exact callsigns
+    callsign_trie: PatriciaMap<(Rc<Country>, Vec<Override>)>,
+    /// A trie holding all callsign prefixes
     prefix_trie: PatriciaMap<(Rc<Country>, Vec<Override>)>,
 }
 
@@ -22,40 +26,55 @@ impl Ctydat {
     #[instrument(skip(s))]
     pub fn from_str(s: &str) -> io::Result<Ctydat> {
         let ts = Instant::now();
-        let countries = parser()
-            .parse(s)
-            .map_err(|err| {
-                tracing::error!("Parse errors found: {:?}", err);
-                io::Error::new(io::ErrorKind::InvalidInput, "parse error")
-            })?;
+
+        let countries = parser().parse(s).map_err(|err| {
+            tracing::error!("Parse errors found: {:?}", err);
+            io::Error::new(io::ErrorKind::InvalidInput, "parse error")
+        })?;
 
         let countries_len = countries.len();
+        let mut callsign_trie = PatriciaMap::new();
         let mut prefix_trie = PatriciaMap::new();
 
         for mut country in countries.into_iter() {
-            let prefix_list = country.prefix_list.clone();
+            let prefix_list = country.prefix_list;
             country.prefix_list = Vec::new();
             let country = Rc::new(country);
             for prefix_alias in prefix_list {
                 match prefix_alias {
-                    Prefix::Prefix(mut prefix, overrides) => {
-                        prefix.make_ascii_lowercase();
-                        prefix_trie.insert_str(&prefix, (country.clone(), overrides.unwrap_or_default()));
+                    Prefix::Callsign(callsign, overrides) => {
+                        let c = callsign.to_ascii_lowercase();
+                        callsign_trie
+                            .insert_str(&c, (country.clone(), overrides.unwrap_or_default()));
                     }
-                    _ => (),
+                    Prefix::Prefix(prefix, overrides) => {
+                        let p = prefix.to_ascii_lowercase();
+                        prefix_trie
+                            .insert_str(&p, (country.clone(), overrides.unwrap_or_default()));
+                    }
                 }
             }
         }
 
-        tracing::debug!(elapsed_ms = ts.elapsed().as_millis(), "Parsed {} records.", countries_len);
+        tracing::debug!(
+            elapsed_ms = ts.elapsed().as_millis(),
+            "Parsed {} records. {} exact callsigns found and {} prefixes found.",
+            countries_len,
+            callsign_trie.len(),
+            prefix_trie.len()
+        );
 
-        Ok(Ctydat { prefix_trie })
+        Ok(Ctydat {
+            callsign_trie,
+            prefix_trie,
+        })
     }
 
     #[instrument(fields(path = %path.as_ref().to_string_lossy()))]
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
         let s = std::fs::read(path)?;
-        let s = std::str::from_utf8(&s).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let s = std::str::from_utf8(&s)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         Self::from_str(s)
     }
 
@@ -63,16 +82,38 @@ impl Ctydat {
     pub fn find_country_for_callsign(&self, callsign: &str) -> Option<Country> {
         let ts = Instant::now();
         let callsign = callsign.to_lowercase();
-        if let Some((_, (country, overrides))) = self.prefix_trie.get_longest_common_prefix(&callsign) {
+
+        if let Some((country, overrides)) = self.callsign_trie.get(&callsign) {
             let country = country.implement_overrides(overrides);
-            tracing::debug!(elapsed_μs = ts.elapsed().as_micros(), "Found match for callsign {callsign}: {country:?}.");
+            tracing::debug!(
+                elapsed_μs = ts.elapsed().as_micros(),
+                "Found exact match for callsign {callsign}: {country:?}."
+            );
             return Some(country);
         }
 
-        tracing::debug!(elapsed_μs = ts.elapsed().as_micros(), "Match not found for callsign {callsign}.");
+        if let Some((_, (country, overrides))) =
+            self.prefix_trie.get_longest_common_prefix(&callsign)
+        {
+            let country = country.implement_overrides(overrides);
+            tracing::debug!(
+                elapsed_μs = ts.elapsed().as_micros(),
+                "Found prefix match for callsign {callsign}: {country:?}."
+            );
+            return Some(country);
+        }
+
+        tracing::debug!(
+            elapsed_μs = ts.elapsed().as_micros(),
+            "Match not found for callsign {callsign}."
+        );
         None
     }
 }
+
+// Before opts: size = 112, align = 8
+// Fix continent: size = 88, align = 8
+// Fix primary prefix: size = 72, align = 8
 
 /// Single country from CTY.DAT file
 ///
@@ -86,7 +127,7 @@ pub struct Country {
     /// ITU Zone
     pub itu_zone: u8,
     /// 2-letter continent abbreviation
-    pub continent: String,
+    pub continent: TinyAsciiStr<2>,
     /// Latitude in degrees, + for North
     pub latitude: f32,
     /// Longitude in degrees, + for West
@@ -94,7 +135,8 @@ pub struct Country {
     /// Local time offset from GMT
     pub time_offset: f32,
     /// Primary DXCC Prefix
-    pub primary_prefix: String,
+    // Longest prefix found from dataset is 5 chars long
+    pub primary_prefix: TinyAsciiStr<8>,
     /// Alias DXCC prefixes including the primary one
     ///
     /// If an alias prefix is a [Prefix::Callsign], this indicates that the
@@ -127,9 +169,10 @@ impl Country {
 #[derive(Debug, Clone)]
 pub enum Prefix {
     /// A single prefix
-    Callsign(String, Option<Vec<Override>>),
+    // Longest found from dataset was 13 chars (A60STAYHOME/1)
+    Callsign(TinyAsciiStr<16>, Option<Vec<Override>>),
     /// A full callsign
-    Prefix(String, Option<Vec<Override>>),
+    Prefix(TinyAsciiStr<8>, Option<Vec<Override>>),
 }
 
 /// A [Country] prefix alias list (see [Country::prefix_list]) can include
@@ -141,7 +184,7 @@ pub enum Override {
     CqZone(u8),
     ItuZone(u8),
     Coordinates(f32, f32),
-    Continent(String),
+    Continent(TinyAsciiStr<2>),
     TimeOffset(f32),
 }
 
@@ -167,7 +210,10 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
         .repeated()
         .exactly(2)
         .labelled("Continent")
-        .collect();
+        .collect::<String>()
+        .try_map(|s, span| {
+            TinyAsciiStr::from_str(&s).map_err(|e| Simple::custom(span, format!("{e}")))
+        });
 
     let latitude = filter(ascii_float)
         .repeated()
@@ -191,13 +237,17 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
         .repeated()
         .at_least(1 /* K, F */)
         .labelled("Primary prefix")
-        .collect();
+        .collect::<String>()
+        .try_map(|s, span| {
+            TinyAsciiStr::from_str(&s).map_err(|e| Simple::custom(span, format!("{e}")))
+        });
 
     let prefix_list = {
         let prefix = filter(|c: &char| c.is_ascii_alphanumeric() || *c == '/')
             .repeated()
             .labelled("DXCC Prefix")
-            .collect();
+            .collect::<String>();
+
         let callsign = just("=").ignore_then(prefix).labelled("Exact callsign");
 
         // The following special characters can be applied after an alias prefix:
@@ -218,14 +268,24 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
             .or(time_offset
                 .delimited_by(just('~'), just('~'))
                 .map(Override::TimeOffset))
-            .or(latitude.then_ignore(just('/')).then(longitude).delimited_by(just('<'), just('>')).map(|(lat, lon)| Override::Coordinates(lat, lon)));
+            .or(latitude
+                .then_ignore(just('/'))
+                .then(longitude)
+                .delimited_by(just('<'), just('>'))
+                .map(|(lat, lon)| Override::Coordinates(lat, lon)));
 
         let one_dxcc = callsign
             .then(over_ride.repeated())
-            .map(|(c, o)| Prefix::Callsign(c, empty_is_none(o)))
-            .or(prefix
-                .then(over_ride.repeated())
-                .map(|(p, o)| Prefix::Prefix(p, empty_is_none(o))));
+            .try_map(|(c, o), span| {
+                let callsign =
+                    TinyAsciiStr::from_str(&c).map_err(|e| Simple::custom(span, format!("{e}")))?;
+                Ok(Prefix::Callsign(callsign, empty_is_none(o)))
+            })
+            .or(prefix.then(over_ride.repeated()).try_map(|(p, o), span| {
+                let prefix =
+                    TinyAsciiStr::from_str(&p).map_err(|e| Simple::custom(span, format!("{e}")))?;
+                Ok(Prefix::Prefix(prefix, empty_is_none(o)))
+            }));
 
         one_dxcc
             .padded()
@@ -287,8 +347,8 @@ fn empty_is_none<V>(i: Vec<V>) -> Option<Vec<V>> {
 
 #[cfg(test)]
 mod tests {
-    use chumsky::Parser;
     use crate::parser;
+    use chumsky::Parser;
 
     const FINLAND: &str = r##"Finland:                  15:  18:  EU:   61.38:   -24.82:    -2.0:  OH:
         OF,OG,OH,OI,OJ,=OH/RX3AMI/LH,
