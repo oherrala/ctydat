@@ -3,9 +3,11 @@
 //! <https://www.country-files.com/cty-dat-format/>
 
 use std::char;
+use std::fmt;
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use chumsky::prelude::*;
@@ -17,38 +19,99 @@ use tracing::instrument;
 #[derive(Debug)]
 pub struct Ctydat {
     /// A trie holding all exact callsigns
-    callsign_trie: PatriciaMap<(Rc<Country>, Vec<Override>)>,
+    callsign_trie: PatriciaMap<(Arc<Country>, Vec<Override>)>,
     /// A trie holding all callsign prefixes
-    prefix_trie: PatriciaMap<(Rc<Country>, Vec<Override>)>,
+    prefix_trie: PatriciaMap<(Arc<Country>, Vec<Override>)>,
 }
 
 impl Ctydat {
+    #[instrument(fields(path = %path.as_ref().to_string_lossy()))]
+    pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
+        let s = std::fs::read(path)?;
+        let s = std::str::from_utf8(&s)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        Self::from_str(s)
+    }
+
     #[instrument(skip(s))]
     pub fn from_str(s: &str) -> io::Result<Ctydat> {
         let ts = Instant::now();
 
         let countries = parser().parse(s).map_err(|err| {
             tracing::error!("Parse errors found: {:?}", err);
-            io::Error::new(io::ErrorKind::InvalidInput, "parse error")
+            return io::Error::new(io::ErrorKind::InvalidInput, "parse error");
         })?;
 
-        let countries_len = countries.len();
+        tracing::debug!(
+            elapsed_ms = ts.elapsed().as_millis(),
+            "Input parsed. {} countries found.",
+            countries.len()
+        );
+
+        Ok(Self::build_tries(countries))
+    }
+
+    /// Search for [Country] information for given callsign.
+    ///
+    /// Returns tuple of callsign or prefix matched and [Country] information.
+    #[instrument(skip(self))]
+    pub fn search_callsign(&self, callsign: &str) -> Option<(String, Country)> {
+        let ts = Instant::now();
+        let callsign = callsign.to_uppercase();
+
+        // First try finding exact callsign
+        if let Some((country, overrides)) = self.callsign_trie.get(&callsign) {
+            let country = country.implement_overrides(overrides);
+            tracing::debug!(
+                elapsed_μs = ts.elapsed().as_micros(),
+                "Found exact match for callsign {callsign}: {country:?}."
+            );
+            return Some((callsign, country));
+        }
+
+        // Second find the longest prefix that matches callsign
+        if let Some((prefix, (country, overrides))) =
+            self.prefix_trie.get_longest_common_prefix(&callsign)
+        {
+            let Ok(prefix) = std::str::from_utf8(prefix) else {
+                return None;
+            };
+            let country = country.implement_overrides(overrides);
+            tracing::debug!(
+                elapsed_μs = ts.elapsed().as_micros(),
+                "Found prefix \"{prefix}\" match for callsign {callsign}: {country:?}."
+            );
+            return Some((prefix.to_owned(), country));
+        }
+
+        tracing::debug!(
+            elapsed_μs = ts.elapsed().as_micros(),
+            "Match not found for callsign {callsign}."
+        );
+
+        None
+    }
+
+    #[instrument(skip(countries))]
+    fn build_tries(countries: Vec<Country>) -> Ctydat {
+        let ts = Instant::now();
+
         let mut callsign_trie = PatriciaMap::new();
         let mut prefix_trie = PatriciaMap::new();
 
         for mut country in countries.into_iter() {
             let prefix_list = country.prefix_list;
             country.prefix_list = Vec::new();
-            let country = Rc::new(country);
+            let country = Arc::new(country);
             for prefix_alias in prefix_list {
                 match prefix_alias {
                     Prefix::Callsign(callsign, overrides) => {
-                        let c = callsign.to_ascii_lowercase();
+                        let c = callsign.to_ascii_uppercase();
                         callsign_trie
                             .insert_str(&c, (country.clone(), overrides.unwrap_or_default()));
                     }
                     Prefix::Prefix(prefix, overrides) => {
-                        let p = prefix.to_ascii_lowercase();
+                        let p = prefix.to_ascii_uppercase();
                         prefix_trie
                             .insert_str(&p, (country.clone(), overrides.unwrap_or_default()));
                     }
@@ -58,62 +121,17 @@ impl Ctydat {
 
         tracing::debug!(
             elapsed_ms = ts.elapsed().as_millis(),
-            "Parsed {} records. {} exact callsigns found and {} prefixes found.",
-            countries_len,
+            "Tries built. {} exact callsigns found and {} prefixes found.",
             callsign_trie.len(),
             prefix_trie.len()
         );
 
-        Ok(Ctydat {
+        Ctydat {
             callsign_trie,
             prefix_trie,
-        })
-    }
-
-    #[instrument(fields(path = %path.as_ref().to_string_lossy()))]
-    pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
-        let s = std::fs::read(path)?;
-        let s = std::str::from_utf8(&s)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        Self::from_str(s)
-    }
-
-    #[instrument(skip(self))]
-    pub fn find_country_for_callsign(&self, callsign: &str) -> Option<Country> {
-        let ts = Instant::now();
-        let callsign = callsign.to_lowercase();
-
-        if let Some((country, overrides)) = self.callsign_trie.get(&callsign) {
-            let country = country.implement_overrides(overrides);
-            tracing::debug!(
-                elapsed_μs = ts.elapsed().as_micros(),
-                "Found exact match for callsign {callsign}: {country:?}."
-            );
-            return Some(country);
         }
-
-        if let Some((_, (country, overrides))) =
-            self.prefix_trie.get_longest_common_prefix(&callsign)
-        {
-            let country = country.implement_overrides(overrides);
-            tracing::debug!(
-                elapsed_μs = ts.elapsed().as_micros(),
-                "Found prefix match for callsign {callsign}: {country:?}."
-            );
-            return Some(country);
-        }
-
-        tracing::debug!(
-            elapsed_μs = ts.elapsed().as_micros(),
-            "Match not found for callsign {callsign}."
-        );
-        None
     }
 }
-
-// Before opts: size = 112, align = 8
-// Fix continent: size = 88, align = 8
-// Fix primary prefix: size = 72, align = 8
 
 /// Single country from CTY.DAT file
 ///
@@ -127,7 +145,7 @@ pub struct Country {
     /// ITU Zone
     pub itu_zone: u8,
     /// 2-letter continent abbreviation
-    pub continent: TinyAsciiStr<2>,
+    pub continent: Continent,
     /// Latitude in degrees, + for North
     pub latitude: f32,
     /// Longitude in degrees, + for West
@@ -165,13 +183,52 @@ impl Country {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum Continent {
+    Af,
+    As,
+    Eu,
+    Na,
+    Oc,
+    Sa,
+}
+
+impl FromStr for Continent {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_ref() {
+            "AF" => Ok(Continent::Af),
+            "AS" => Ok(Continent::As),
+            "EU" => Ok(Continent::Eu),
+            "NA" => Ok(Continent::Na),
+            "OC" => Ok(Continent::Oc),
+            "SA" => Ok(Continent::Sa),
+            _ => Err(format!("Invalid continent \"{s}\"")),
+        }
+    }
+}
+
+impl fmt::Display for Continent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Continent::Af => f.write_str("AF"),
+            Continent::As => f.write_str("AS"),
+            Continent::Eu => f.write_str("EU"),
+            Continent::Na => f.write_str("NA"),
+            Continent::Oc => f.write_str("OC"),
+            Continent::Sa => f.write_str("SA"),
+        }
+    }
+}
+
 /// A single prefix or exact callsign
 #[derive(Debug, Clone)]
 pub enum Prefix {
-    /// A single prefix
+    /// A full callsign
     // Longest found from dataset was 13 chars (A60STAYHOME/1)
     Callsign(TinyAsciiStr<16>, Option<Vec<Override>>),
-    /// A full callsign
+    /// A single prefix
     Prefix(TinyAsciiStr<8>, Option<Vec<Override>>),
 }
 
@@ -184,7 +241,7 @@ pub enum Override {
     CqZone(u8),
     ItuZone(u8),
     Coordinates(f32, f32),
-    Continent(TinyAsciiStr<2>),
+    Continent(Continent),
     TimeOffset(f32),
 }
 
@@ -212,7 +269,7 @@ fn parser() -> impl Parser<char, Vec<Country>, Error = Simple<char>> {
         .labelled("Continent")
         .collect::<String>()
         .try_map(|s, span| {
-            TinyAsciiStr::from_str(&s).map_err(|e| Simple::custom(span, format!("{e}")))
+            Continent::from_str(&s).map_err(|e| Simple::custom(span, format!("{e}")))
         });
 
     let latitude = filter(ascii_float)
