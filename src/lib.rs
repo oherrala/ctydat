@@ -16,6 +16,14 @@ use patricia_tree::PatriciaMap;
 use tinystr::TinyAsciiStr;
 use tracing::instrument;
 
+pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Ctydat> {
+    Ctydat::from_path(path)
+}
+
+pub fn from_str(s: &str) -> io::Result<Ctydat> {
+    Ctydat::from_str(s)
+}
+
 #[derive(Debug)]
 pub struct Ctydat {
     /// A trie holding all exact callsigns

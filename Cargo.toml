@@ -8,7 +8,7 @@ edition = "2021"
 
 readme = "README.md"
 repository = "https://github.com/oherrala/ctydat"
-keywords = [ "parser" ]
+keywords = [ "parser", "hamradio" ]
 categories = [ "encoding" ]
 
 [dependencies]
